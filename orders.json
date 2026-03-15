@@ -1,0 +1,30 @@
+[
+  {
+    "customer": "Иван",
+    "recipe": "меренговый_рулет_белый",
+    "quantity": 2.0,
+    "due_date": "2026-03-20",
+    "status": "pending"
+  },
+  {
+    "customer": "Иван",
+    "recipe": "меренговый_рулет_белый",
+    "quantity": 2.0,
+    "due_date": "2026-03-13",
+    "status": "pending"
+  },
+  {
+    "customer": "Иван",
+    "recipe": "меренговый_рулет_белый",
+    "quantity": 2.0,
+    "due_date": "2026-03-14",
+    "status": "pending"
+  },
+  {
+    "customer": "Иван",
+    "recipe": "тест_хлеб",
+    "quantity": 2.0,
+    "due_date": "2026-03-16",
+    "status": "pending"
+  }
+]

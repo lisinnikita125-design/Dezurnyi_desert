@@ -1,0 +1,86 @@
+[
+  {
+    "date": "2026-03-15T10:36:35.757427",
+    "ingredient": "тест_цена",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T10:40:08.535349",
+    "ingredient": "тест_цена",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T10:40:41.145794",
+    "ingredient": "тест_цена",
+    "old_price": 100.0,
+    "new_price": 120.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T13:18:46.526497",
+    "ingredient": "тест_мука",
+    "old_price": null,
+    "new_price": 50.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T13:27:10.693338",
+    "ingredient": "тест_мука",
+    "old_price": null,
+    "new_price": 50.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:13:58.565255",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:23:20.705814",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:37:04.057791",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:38:28.456016",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:44:17.137987",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:47:51.909120",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  },
+  {
+    "date": "2026-03-15T19:58:32.085003",
+    "ingredient": "тест_сливки",
+    "old_price": null,
+    "new_price": 100.0,
+    "unit": "кг"
+  }
+]
