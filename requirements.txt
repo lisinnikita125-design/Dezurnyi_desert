@@ -5,3 +5,4 @@ APScheduler==3.11.2
 pytz==2026.1.post1
 tzlocal==5.3.1
 flask==3.1.0
+openpyxl==3.1.5
