@@ -3089,6 +3089,141 @@ async def open_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Партия '{batch['id']}' от {batch['purchase_date']} отмечена как открытая.\n"
         f"Новый срок годности: {expiry_after_open} (через {after_open_days} дн. после вскрытия)."
     )
+# ========== Команда /price (умная цена) ==========
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает рекомендованную цену на основе себестоимости и наценок"""
+    # Если команда вызвана без аргументов, начинаем диалог
+    if not context.args:
+        await update.message.reply_text(
+            "Введите название рецепта (и количество через пробел, если нужно):\n"
+            "Например: Меренговый рулет 2"
+        )
+        return
+
+    # Пытаемся распарсить аргументы
+    # Последний аргумент может быть количеством (числом), остальное — название
+    *name_parts, last = context.args
+    try:
+        qty = float(last.replace(',', '.'))
+        name = ' '.join(name_parts).lower()
+    except ValueError:
+        # Если последний аргумент не число, значит количество не указано
+        qty = 1.0
+        name = ' '.join(context.args).lower()
+
+    # Проверяем, существует ли рецепт
+    if name not in recipes:
+        await update.message.reply_text(f"Рецепт '{name}' не найден. Проверьте название.")
+        return
+
+    # Получаем данные рецепта
+    data = recipes[name]
+
+    # --- Расчёт себестоимости (копируем логику из calculate_cost, но с учётом масштабирования) ---
+    if isinstance(data, dict) and "type" in data:
+        # Масштабируемый рецепт
+        ing_dict = data["ingredients"]
+        base_qty = data.get("base_qty", 1)
+        # Масштабируем на нужное количество
+        scale = qty / base_qty if data["type"] == "weight" else qty
+        scaled = {ing: ing_qty * scale for ing, ing_qty in ing_dict.items()}
+    else:
+        # Старый формат
+        ing_dict = data if not isinstance(data, dict) else data.get("ingredients", data)
+        portions = data.get("portions", 1) if isinstance(data, dict) else 1
+        scale = qty / portions if portions != 1 else qty
+        scaled = {ing: ing_qty * scale for ing, ing_qty in ing_dict.items()}
+
+    # Считаем себестоимость ингредиентов
+    total_ing = 0.0
+    missing = []
+    for ing_name, ing_qty in scaled.items():
+        if ing_name in ingredients:
+            total_ing += ingredients[ing_name]["price"] * ing_qty
+        else:
+            missing.append(ing_name)
+
+    if missing:
+        await update.message.reply_text(f"❌ Не хватает ингредиентов в базе: {', '.join(missing)}")
+        return
+
+    # Добавляем упаковку и работу
+    packaging = data.get('packaging', 0.0) if isinstance(data, dict) else 0.0
+    work_hours = data.get('work_hours', 0.0) if isinstance(data, dict) else 0.0
+    hourly_rate = settings.get('hourly_rate', 0.0)
+    work_cost = work_hours * hourly_rate * (qty if 'type' in data and data['type']=='pcs' else 1)
+
+    total_cost = total_ing + packaging * (qty if 'type' in data and data['type']=='pcs' else 1) + work_cost
+
+    # --- Формируем рекомендованные цены ---
+    # Минимальная наценка 30%
+    price_min = total_cost * 1.3
+    # Оптимальная наценка 50%
+    price_opt = total_cost * 1.5
+    # Премиум наценка 70%
+    price_premium = total_cost * 1.7
+
+    # Определяем единицу измерения
+    if isinstance(data, dict) and data.get("type") == "weight":
+        unit = "кг"
+        qty_text = f"{qty} кг"
+    else:
+        unit = "шт"
+        qty_text = f"{qty} шт"
+
+    # Формируем сообщение
+    msg = (
+        f"🍰 {name}\n"
+        f"Количество: {qty_text}\n"
+        f"Себестоимость: {total_cost:.2f} руб\n\n"
+        f"💡 Рекомендованные цены:\n\n"
+        f"Минимальная (работать без риска)\n"
+        f"{price_min:.2f} руб\n\n"
+        f"Оптимальная (нормальная прибыль)\n"
+        f"{price_opt:.2f} руб\n\n"
+        f"Премиум (для сложных заказов)\n"
+        f"{price_premium:.2f} руб"
+    )
+
+    # Создаём кнопки для быстрого применения цены
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{price_min:.0f} ₽", callback_data=f"price_use_{name}_{price_min:.2f}_{qty}"),
+            InlineKeyboardButton(f"{price_opt:.0f} ₽", callback_data=f"price_use_{name}_{price_opt:.2f}_{qty}"),
+            InlineKeyboardButton(f"{price_premium:.0f} ₽", callback_data=f"price_use_{name}_{price_premium:.2f}_{qty}")
+        ],
+        [InlineKeyboardButton("❌ Отмена", callback_data="price_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(msg, reply_markup=reply_markup)
+
+
+# ========== Обработчик нажатий кнопок для /price ==========
+async def price_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("price_use_"):
+        # Формат: price_use_<name>_<price>_<qty>
+        parts = data.split('_', 3)  # разделим на 4 части: price, use, name, остальное
+        # parts = ['price', 'use', 'название', 'цена_количество']
+        name = parts[2]
+        rest = parts[3]
+        # В rest последний элемент — количество, остальное — цена (может содержать точки)
+        *price_parts, qty_str = rest.split('_')
+        price = float('_'.join(price_parts))
+        qty = float(qty_str)
+
+        # Здесь можно либо сразу списать продажу с этой ценой, либо предложить подтверждение
+        # Для начала просто покажем, что цена выбрана
+        await query.edit_message_text(
+            f"✅ Выбрана цена {price:.2f} руб для {qty} шт '{name}'.\n"
+            f"Теперь можно выполнить продажу командой /use {name} {qty} {price}"
+        )
+    elif data == "price_cancel":
+        await query.edit_message_text("❌ Выбор цены отменён.")
 def main():
     TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -3179,7 +3314,8 @@ def main():
     application.add_handler(CommandHandler("export_full_excel", export_full_excel))
     application.add_handler(CommandHandler("set_shelf_life", set_shelf_life))
     application.add_handler(CommandHandler("open_batch", open_batch))
-
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CallbackQueryHandler(price_button_handler, pattern="^price_"))
     # Обработчик callback-запросов (inline кнопки) – ВАЖНО: передаём функцию, а не строку
     application.add_handler(CallbackQueryHandler(button_handler))
 
