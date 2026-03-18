@@ -5,34 +5,39 @@ import csv
 import re
 import zipfile
 import io
-import openpyxl
-import datetime
-from io import StringIO
+import uuid
+from io import StringIO, BytesIO
 from datetime import datetime, timedelta, time
 from datetime import date
 from dotenv import load_dotenv
+import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
-
-load_dotenv()  # загружает переменные из .env
-
-# Импорты из telegram
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
 from telegram.request import HTTPXRequest
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# Если используете какие-то дополнительные модули, добавьте их ниже
-# ... остальные импорты (telegram и т.д.)  # загружает переменные из файла .env
-# ========== Настройка логирования ==========
+
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-writeoffs = []  # список списаний и возвратов
-price_history = []  # список записей об изменении цен
 # ========== Константы ==========
 # Константы файлов
 INGREDIENTS_FILE = "ingredients.json"
@@ -45,6 +50,8 @@ ORDERS_FILE = "orders.json"
 WRITEOFFS_FILE = "writeoffs.json"
 PRICE_HISTORY_FILE = "price_history.json"
 BATCHES_FILE = "batches.json"
+# Состояния для онбординга
+ONBOARDING_START, ONBOARDING_INGREDIENT, ONBOARDING_RECIPE, ONBOARDING_PRICE, ONBOARDING_FINISH = range(5)
 # ========== Тексты для разделов помощи ==========
 HELP_MAIN = (
     "📋 Основные команды\n\n"
@@ -106,6 +113,9 @@ HELP_SALES = (
     "/use название [количество] [факт_цена] - списать ингредиенты и зафиксировать продажу\n"
     "  Пример: /use рулет 2 (цена по наценке)\n"
     "  Пример: /use рулет 2 1500 (общая сумма продажи)\n"
+    "/order название_рецепта количество [цена_продажи] - добавить заказ (оценка, без списания)\n"
+    "  Пример: /order рулет 2 (цена по наценке)\n"
+    "  Пример: /order рулет 2 1500 (с указанием цены)\n"
     "/stats [день|неделя|месяц|год] - статистика продаж за период\n"
     "  Пример: /stats месяц\n"
     "/popular - топ-5 рецептов по продажам"
@@ -125,7 +135,7 @@ HELP_CUSTOMERS = (
     "📅 Клиенты и заказы\n\n"
     "/add_customer имя телефон [адрес] - добавить клиента\n"
     "  Пример: /add_customer Иван +79991234567\n"
-    "/order клиент рецепт количество ГГГГ-ММ-ДД - создать предзаказ\n"
+    "/preorder клиент рецепт количество ГГГГ-ММ-ДД - создать предзаказ\n"
     "  Пример: /order Иван меренговый_рулет_белый 2 2026-03-20\n"
     "/orders [ГГГГ-ММ-ДД] - показать заказы на дату\n"
     "  Пример: /orders 2026-03-20\n"
@@ -195,18 +205,11 @@ sales = []
 plans = []
 customers = {}
 orders = []
-price_history = []  # глобальный список истории цен
-batches = []  # глобальный список партий
+batches = []
+price_history = []  # глобальный список партий
+writeoffs = []  # список списаний и возвратов
 # Состояния для диалога импорта рецепта
 WAITING_RECIPE_TEXT, WAITING_INGREDIENT_PRICE, WAITING_RECIPE_NAME, WAITING_RECIPE_TYPE = range(4)
-# ========== Глобальные переменные ==========
-ingredients = {}
-recipes = {}
-settings = {}  # для хранения почасовой ставки и др.
-plans = []  # глобальный список планов
-sales = []  # глобальный список продаж
-customers = {}
-orders = []
 # ========== Функции для работы с файлами ==========
 def load_settings():
     global settings
@@ -294,6 +297,163 @@ def load_orders():
             orders = []
     else:
         orders = []
+
+def save_orders():
+    with open(ORDERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(orders, f, ensure_ascii=False, indent=2)
+# ========== Команда /order (новый заказ) ==========
+# ========== Команда /order (новый заказ) ==========
+# ========== Команда /order (новый заказ) ==========
+async def order_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет новый заказ: /order название_рецепта количество [цена_продажи]"""
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Формат: /order название_рецепта количество [цена_продажи]\n"
+            "Примеры:\n"
+            "/order меренговый_рулет_фисташковый 2\n"
+            "/order меренговый_рулет_фисташковый 2 3500"
+        )
+        return
+
+    # Парсим аргументы
+    price = None
+    qty = None
+    name_parts = args
+
+    try:
+        last_arg = args[-1].replace(',', '.')
+        float(last_arg)
+        if len(args) >= 3:
+            try:
+                qty = float(args[-2].replace(',', '.'))
+                price = float(last_arg)
+                name_parts = args[:-2]
+            except ValueError:
+                qty = float(last_arg)
+                name_parts = args[:-1]
+        else:
+            qty = float(last_arg)
+            name_parts = args[:-1]
+    except ValueError:
+        qty = 1.0
+        name_parts = args
+
+    name = ' '.join(name_parts).lower()
+
+    if name not in recipes:
+        await update.message.reply_text(f"Рецепт '{name}' не найден.")
+        return
+
+    data = recipes[name]
+
+    # --- Расчёт себестоимости ---
+    if isinstance(data, dict) and "type" in data:
+        ing_dict = data["ingredients"]
+        base_qty = data.get("base_qty", 1)
+        scale = qty / base_qty if data["type"] == "weight" else qty
+    else:
+        ing_dict = data.get("ingredients", data) if isinstance(data, dict) else data
+        portions = data.get("portions", 1) if isinstance(data, dict) else 1
+        scale = qty / portions if portions != 1 else qty
+
+    scaled = {ing: ing_qty * scale for ing, ing_qty in ing_dict.items()}
+
+    total_ing = 0.0
+    missing = []
+    for ing_name, ing_qty in scaled.items():
+        if ing_name in ingredients:
+            total_ing += ingredients[ing_name]["price"] * ing_qty
+        else:
+            missing.append(ing_name)
+
+    if missing:
+        await update.message.reply_text(f"❌ Не хватает ингредиентов в базе: {', '.join(missing)}")
+        return
+
+    packaging = data.get('packaging', 0.0) if isinstance(data, dict) else 0.0
+    work_hours = data.get('work_hours', 0.0) if isinstance(data, dict) else 0.0
+    hourly_rate = settings.get('hourly_rate', 0.0)
+    work_cost = work_hours * hourly_rate * (qty if 'type' in data and data['type'] == 'pcs' else 1)
+
+    total_cost = total_ing + packaging * (qty if 'type' in data and data['type'] == 'pcs' else 1) + work_cost
+
+    if price is None:
+        markup = data.get('markup', 50) if isinstance(data, dict) else 50
+        price = total_cost * (1 + markup / 100)
+        price = round(price)
+
+    profit = price - total_cost
+
+    # Запись заказа
+    order_record = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "recipe": name,
+        "quantity": qty,
+        "cost": total_cost,
+        "revenue": price,
+        "profit": profit
+    }
+    orders.append(order_record)
+    save_orders()
+
+    # Формируем ответ (без Markdown)
+    msg = (
+        f"📦 Заказ добавлен\n\n"
+        f"Десерт: {name}\n"
+        f"Количество: {qty} шт\n\n"
+        f"Себестоимость: {total_cost:.0f} ₽\n"
+        f"Цена продажи: {price:.0f} ₽\n\n"
+        f"💰 Прибыль: {profit:.0f} ₽"
+    )
+    await update.message.reply_text(msg)
+# ========== Команда /profit ==========
+async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает прибыль за сегодня и месяц (без Markdown)"""
+    today = datetime.now().date()
+    start_of_month = datetime(today.year, today.month, 1).date()
+
+    today_orders = []
+    month_orders = []
+
+    for order in orders:
+        # Проверяем, есть ли ключ 'date' (новый формат) или 'due_date' (старый формат)
+        if 'date' in order:
+            order_date = datetime.strptime(order['date'], "%Y-%m-%d").date()
+        elif 'due_date' in order:
+            order_date = datetime.strptime(order['due_date'], "%Y-%m-%d").date()
+        else:
+            continue  # пропускаем, если нет даты
+
+        if order_date == today:
+            today_orders.append(order)
+        if order_date >= start_of_month:
+            month_orders.append(order)
+
+    def calc_stats(order_list):
+        count = len(order_list)
+        revenue = sum(o.get('revenue', o.get('price', 0)) for o in order_list)
+        cost = sum(o.get('cost', 0) for o in order_list)
+        profit = revenue - cost
+        return count, revenue, cost, profit
+
+    today_count, today_rev, today_cost, today_profit = calc_stats(today_orders)
+    month_count, month_rev, month_cost, month_profit = calc_stats(month_orders)
+
+    msg = (
+        f"📊 Прибыль\n\n"
+        f"Сегодня\n"
+        f"Заказы: {today_count}\n"
+        f"Выручка: {today_rev:.0f} ₽\n"
+        f"Себестоимость: {today_cost:.0f} ₽\n"
+        f"Прибыль: {today_profit:.0f} ₽\n\n"
+        f"Месяц\n"
+        f"Заказы: {month_count}\n"
+        f"Выручка: {month_rev:.0f} ₽\n"
+        f"Себестоимость: {month_cost:.0f} ₽\n"
+        f"Прибыль: {month_profit:.0f} ₽"
+    )
+    await update.message.reply_text(msg)
 def load_writeoffs():
     global writeoffs
     if os.path.exists(WRITEOFFS_FILE):
@@ -346,7 +506,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, first_time=False):
-    """Показывает главное меню с reply-кнопками"""
+    """Показывает главное меню"""
     if update.message:
         if first_time:
             user = update.effective_user
@@ -354,72 +514,211 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, fir
             greeting = f"👋 Привет, {name}! Я помогу управлять кондитерским производством.\nЧто будем делать?"
             await update.message.reply_text(greeting, reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text("Выберите действие:", reply_markup=get_main_keyboard())
+            await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard())
     elif update.callback_query:
-        # Если вызов из Inline-кнопки (старые), то отправляем новое сообщение с клавиатурой
-        await update.callback_query.message.reply_text("Выберите действие:", reply_markup=get_main_keyboard())
+        await update.callback_query.message.reply_text("Главное меню:", reply_markup=get_main_keyboard())
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "➕ Добавить ингредиент":
-        await update.message.reply_text(
-            "Чтобы добавить ингредиент, отправьте:\n"
-            "/add_ingredient название цена единица\n"
-            "или с ценой за упаковку: /add_ingredient название цена_упаковки вес_упаковки единица_веса\n\n"
-            "Примеры:\n"
-            "/add_ingredient мука 50 кг\n"
-            "/add_ingredient масло 209.99 180 г"
-        )
-        return
-    elif text == "📋 Список ингредиентов":
-        await show_ingredients(update, context)
-        return
-    elif text == "🍰 Добавить рецепт":
-        await update.message.reply_text(
-            "Чтобы добавить рецепт, отправьте:\n"
-            "/add_recipe Название: порции; ингредиенты (старый формат)\n"
-            "или /add_recipe2 название тип базовое_количество: ингредиенты (для масштабирования)\n\n"
-            "Примеры:\n"
-            "/add_recipe Омлет: 2; яйца 3, молоко 0.1\n"
-            "/add_recipe2 торт вес 1: мука 0.5, сахар 0.2, яйца 3"
-        )
-        return
-    elif text == "💰 Рассчитать себестоимость":
-        await update.message.reply_text(
-            "Введите название десерта для расчёта:\n"
-            "/calculate название\n"
-            "Например: /calculate омлет"
-        )
-        return
-    elif text == "📖 Мои рецепты":
-        await list_recipes(update, context)
-        return
-    elif text == "⚖️ Пересчитать рецепт":
-        await update.message.reply_text(
-            "Чтобы пересчитать рецепт на нужный вес/количество:\n"
-            "/scale название новое_количество [единица]\n\n"
-            "Примеры:\n"
-            "/scale торт 2.5 кг\n"
-            "/scale печенье 30 шт"
-        )
-        return
-    elif text == "📦 Остатки":
-        await show_stock(update, context)
-        return
-    elif text == "🛒 Список покупок":
-        await shopping_list(update, context)
-        return
-    elif text == "📊 Аналитика":
-        await stats(update, context)  # вызовет stats без аргументов → период "месяц"
-        return
-    elif text == "📅 Заказы":
-        await list_orders(update, context)
-        return
-    elif text == "❓ Помощь":
-        await help_command(update, context)
-        return
-    else:
-        # Если текст не кнопка, просто выходим, чтобы сработал echo
-        return
+    try:
+        text = update.message.text
+        print(f"🔍 handle_menu_buttons получил текст: '{text}'")
+
+        # ---- Главное меню ----
+        if text == "📦 Ингредиенты":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_ingredients_submenu())
+            return
+        elif text == "🍰 Рецепты":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_recipes_submenu())
+            return
+        elif text == "💰 Продажи":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_sales_submenu())
+            return
+        elif text == "📊 Аналитика":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_analytics_submenu())
+            return
+        elif text == "🛒 Закупки":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_purchases_submenu())
+            return
+        elif text == "👥 Клиенты":
+            await update.message.reply_text("Выберите действие:", reply_markup=get_customers_submenu())
+            return
+        elif text == "❓ Помощь":
+            await help_command(update, context)
+            return
+
+        # ---- Подменю Ингредиенты ----
+        elif text == "➕ Добавить ингредиент":
+            # Запускаем диалог добавления ингредиента? Пока просто инструкция
+            await update.message.reply_text(
+                "Чтобы добавить ингредиент, отправьте:\n"
+                "/add_ingredient название цена единица\n"
+                "Или с ценой за упаковку: /add_ingredient название цена_упаковки вес_упаковки единица_веса\n\n"
+                "Примеры:\n"
+                "/add_ingredient мука 50 кг\n"
+                "/add_ingredient масло 209.99 180 г"
+            )
+            return
+        elif text == "📋 Список ингредиентов":
+            await show_ingredients(update, context)
+            return
+        elif text == "🔄 Обновить цену":
+            await update.message.reply_text(
+                "Чтобы обновить цену, отправьте:\n"
+                "/update_price название новая_цена\n"
+                "Пример: /update_price мука 55"
+            )
+            return
+        elif text == "📦 Закупка (партия)":
+            await update.message.reply_text(
+                "Чтобы зарегистрировать закупку, отправьте:\n"
+                "/purchase ингредиент количество цена ГГГГ-ММ-ДД [поставщик]\n"
+                "Пример: /purchase мука 10 500 2026-06-01 Мельница"
+            )
+            return
+        elif text == "⏰ Сроки годности":
+            await update.message.reply_text(
+                "Чтобы установить сроки годности для ингредиента, отправьте:\n"
+                "/set_shelf_life ингредиент общий_срок [срок_после_вскрытия]\n"
+                "Пример: /set_shelf_life сливки 14 5\n\n"
+                "Посмотреть истекающие сроки: /expiring"
+            )
+            return
+
+        # ---- Подменю Рецепты ----
+        elif text == "➕ Новый рецепт":
+            await update.message.reply_text(
+                "Чтобы добавить рецепт, отправьте:\n"
+                "/add_recipe2 название тип базовое_количество: ингредиенты\n"
+                "Пример: /add_recipe2 торт вес 1: мука 0.5, сахар 0.2, яйца 3"
+            )
+            return
+        elif text == "📋 Мои рецепты":
+            await list_recipes(update, context)
+            return
+        elif text == "🔍 Показать рецепт":
+            await update.message.reply_text(
+                "Введите название рецепта: /show_recipe название\n"
+                "Пример: /show_recipe меренговый_рулет_белый"
+            )
+            return
+        elif text == "⚖️ Пересчитать":
+            await update.message.reply_text(
+                "Чтобы пересчитать рецепт, отправьте:\n"
+                "/scale название новое_количество [единица]\n"
+                "Пример: /scale торт 2.5 кг"
+            )
+            return
+        elif text == "💰 Себестоимость":
+            await update.message.reply_text(
+                "Введите название рецепта: /calculate название\n"
+                "Пример: /calculate меренговый_рулет_белый"
+            )
+            return
+        elif text == "📈 Прайс-лист":
+            await price_list(update, context)
+            return
+
+                # ---- Подменю Продажи ----
+        elif text == "📦 Новый заказ":
+            await update.message.reply_text(
+                "Введите название рецепта и количество:\n"
+                "Например: `меренговый_рулет_фисташковый 2`\n\n"
+                "Или используйте команду: /order название количество [цена]"
+            )
+            return
+        elif text == "💵 Рекомендованная цена":
+            await update.message.reply_text(
+                "Введите название рецепта и количество:\n"
+                "/price название количество\n"
+                "Пример: /price меренговый_рулет_белый 2"
+            )
+            return
+        elif text == "📊 Прибыль":
+            await profit_command(update, context)  # вызываем новую команду
+            return
+        elif text == "🏆 Популярные":
+            await popular(update, context)
+            return
+        elif text == "🔄 Возврат":
+            await update.message.reply_text(
+                "Чтобы оформить возврат, отправьте:\n"
+                "/refund клиент рецепт количество [дата] [причина]\n"
+                "Пример: /refund Иван меренговый_рулет_белый 1 не понравился"
+            )
+            return
+        elif text == "❌ Списание":
+            await update.message.reply_text(
+                "Чтобы списать продукцию, отправьте:\n"
+                "/write_off название количество [причина]\n"
+                "Пример: /write_off мука 0.5 просыпалась"
+            )
+            return
+        # ---- Подменю Аналитика ----
+        elif text == "📈 Прибыль за месяц":
+            await stats(update, context)  # пока то же, что и stats
+            return
+        elif text == "📉 Самые прибыльные":
+            await popular(update, context)  # пока то же, позже сделаем /top_profit
+            return
+        elif text == "📊 Отчёт Excel":
+            await report_xlsx(update, context)
+            return
+
+        # ---- Подменю Закупки ----
+        elif text == "🛒 Список покупок":
+            await shopping(update, context)
+            return
+        elif text == "📦 Запланировать":
+            await update.message.reply_text(
+                "Чтобы запланировать производство, отправьте:\n"
+                "/plan рецепт количество ГГГГ-ММ-ДД\n"
+                "Пример: /plan меренговый_рулет_белый 5 2026-03-20"
+            )
+            return
+        elif text == "⏳ Истекающие сроки":
+            await expiring(update, context)
+            return
+
+        # ---- Подменю Клиенты ----
+        elif text == "➕ Новый клиент":
+            await update.message.reply_text(
+                "Чтобы добавить клиента, отправьте:\n"
+                "/add_customer имя телефон [адрес]\n"
+                "Пример: /add_customer Иван +79991234567"
+            )
+            return
+        elif text == "📅 Создать заказ":
+            await update.message.reply_text(
+                "Чтобы создать предзаказ, отправьте:\n"
+                "/order клиент рецепт количество ГГГГ-ММ-ДД\n"
+                "Пример: /order Иван меренговый_рулет_белый 2 2026-03-20"
+            )
+            return
+        elif text == "📋 Заказы на дату":
+            await update.message.reply_text(
+                "Введите дату: /orders ГГГГ-ММ-ДД\n"
+                "Пример: /orders 2026-03-20"
+            )
+            return
+        elif text == "🔔 Напоминания":
+            await remind_orders(update, context)
+            return
+
+        # ---- Кнопка "Назад" ----
+        elif text == "« Назад":
+            await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard())
+            return
+
+        else:
+            print(f"⚠️ Неизвестный текст: {text}")
+            # Если текст не распознан, можно просто показать главное меню
+            # await update.message.reply_text("Не понял команду. Выберите действие:", reply_markup=get_main_keyboard())
+            return
+
+    except Exception as e:
+        print(f"❌ Ошибка в handle_menu_buttons: {e}")
+        import traceback
+        traceback.print_exc()
+        await update.message.reply_text("Произошла внутренняя ошибка. Пожалуйста, сообщите разработчику.")
 async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ingredients:
         await update.message.reply_text("Список ингредиентов пуст")
@@ -436,10 +735,8 @@ async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += line
     await update.message.reply_text(msg)
 async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Списать ингредиенты на приготовление с учётом партий (FEFO)"""
+    """Списать ингредиенты на приготовление: /use рецепт [количество] [фактическая_цена]"""
     args = context.args
-    today = datetime.now().date()
-
     if len(args) < 1:
         await update.message.reply_text(
             "Формат: /use название_рецепта [количество] [фактическая_цена]\n"
@@ -450,7 +747,7 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Определяем количество и цену (как раньше)
+    # Определяем количество и цену
     possible_qty = None
     possible_price = None
     name_parts = args[:]
@@ -475,12 +772,20 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = ' '.join(name_parts).lower()
     qty = possible_qty if possible_qty is not None else 1.0
+    price = possible_price
 
-    if name not in recipes:
-        await update.message.reply_text(f"Рецепт '{name}' не найден")
-        return
+    result_msg = await execute_sale(update, context, name, qty, price)
+    await update.message.reply_text(result_msg)
+async def execute_sale(update: Update, context: ContextTypes.DEFAULT_TYPE, recipe_name: str, qty: float, price: float = None):
+    """
+    Выполняет продажу: списывает ингредиенты, записывает продажу.
+    Возвращает сообщение для пользователя.
+    """
+    if recipe_name not in recipes:
+        return f"❌ Рецепт '{recipe_name}' не найден."
 
-    data = recipes[name]
+    data = recipes[recipe_name]
+
     # Получаем ингредиенты рецепта
     if isinstance(data, dict) and "ingredients" in data:
         ing_dict = data["ingredients"]
@@ -490,7 +795,7 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Масштабируем на нужное количество
     needed = {ing: ing_qty * qty for ing, ing_qty in ing_dict.items()}
 
-    # Проверяем наличие и списываем по партиям
+    # Проверяем наличие по партиям
     missing = []
     total_ing_cost = 0.0
 
@@ -501,7 +806,6 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Находим все активные партии для этого ингредиента
         ing_batches = [b for b in batches if b.get('is_active', True) and b['ingredient'] == ing_name]
-        # Сортируем по исходному сроку годности (FEFO)
         ing_batches.sort(key=lambda b: b['expiry_date'])
 
         remaining = need_qty
@@ -516,14 +820,15 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 expiry = datetime.fromisoformat(batch['expiry_date']).date()
 
             # Проверяем, не просрочена ли партия
-            if expiry < today:
-                continue  # пропускаем просроченные
+            if expiry < datetime.now().date():
+                continue
 
             # Если партия не открыта, открываем её при первом списании
             if not batch.get('opened_date'):
-                batch['opened_date'] = today.isoformat()
+                batch['opened_date'] = datetime.now().date().isoformat()
                 after_open_days = ingredients[ing_name].get('shelf_life_after_open', ingredients[ing_name].get('shelf_life', 30))
-                batch['expiry_after_open'] = (today + timedelta(days=after_open_days)).isoformat()
+                batch['expiry_after_open'] = (datetime.now().date() + timedelta(days=after_open_days)).isoformat()
+
             available = batch['current_quantity']
             take = min(available, remaining)
             if take <= 0:
@@ -544,9 +849,7 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             missing.append(f"{ing_name} (не хватает {remaining:.2f} {ingredients[ing_name]['unit']})")
 
     if missing:
-        # Если чего-то не хватает, не сохраняем изменения
-        await update.message.reply_text(f"❌ Недостаточно ингредиентов:\n" + "\n".join(missing))
-        return
+        return f"❌ Недостаточно ингредиентов:\n" + "\n".join(missing)
 
     # Сохраняем изменения в партиях
     save_batches()
@@ -564,38 +867,38 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_cost = total_ing_cost + packaging * qty + work_cost
 
-    # Определяем цену продажи
-    if possible_price is not None:
-        price_sale = possible_price
-        profit = price_sale - total_cost
-    else:
+    # Если цена не передана, рассчитываем по наценке
+    if price is None:
         if markup is not None:
-            price_sale = total_cost * (1 + markup / 100)
-            profit = price_sale - total_cost
+            price = total_cost * (1 + markup / 100)
         else:
-            price_sale = None
-            profit = None
+            price = None
+
+    if price is not None:
+        profit = price - total_cost
+    else:
+        profit = None
 
     # Запись о продаже
     sale_record = {
         "date": datetime.now().isoformat(),
-        "recipe": name,
+        "recipe": recipe_name,
         "quantity": qty,
         "cost": total_ing_cost,
         "cost_with_extras": total_cost,
-        "price": price_sale,
+        "price": price,
         "profit": profit
     }
     sales.append(sale_record)
     save_sales()
 
     # Формируем ответ
-    msg = f"✅ Приготовлено {qty} шт '{name}'. Ингредиенты списаны.\n"
+    msg = f"✅ Приготовлено {qty} шт '{recipe_name}'. Ингредиенты списаны.\n"
     msg += f"💰 Себестоимость ингредиентов: {total_ing_cost:.2f} руб\n"
     if packaging or work_cost:
         msg += f"🧾 Полная себестоимость: {total_cost:.2f} руб\n"
-    if price_sale is not None:
-        msg += f"💵 Цена продажи: {price_sale:.2f} руб\n"
+    if price is not None:
+        msg += f"💵 Цена продажи: {price:.2f} руб\n"
         if profit is not None:
             msg += f"💸 Прибыль: {profit:.2f} руб\n"
             if total_cost > 0:
@@ -603,7 +906,7 @@ async def use_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += f"❓ Наценка не задана, цена продажи не рассчитана."
 
-    await update.message.reply_text(msg)
+    return msg
 def recalc_ingredient_stock(ingredient):
     """Пересчитывает общий остаток ингредиента по всем активным партиям и обновляет ingredients.json"""
     total = sum(b['current_quantity'] for b in batches if b.get('is_active', True) and b['ingredient'] == ingredient)
@@ -862,25 +1165,72 @@ async def popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать заказы на указанную дату (по умолчанию сегодня): /orders [ГГГГ-ММ-ДД]"""
-    target_date = None
+    # Парсим дату
     if context.args:
         try:
             target_date = datetime.strptime(context.args[0], "%Y-%m-%d").date()
-        except:
+        except ValueError:
             await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
             return
     else:
         target_date = datetime.now().date()
 
-    msg = f"📅 Заказы на {target_date}:\n"
+    msg_lines = [f"📅 Заказы на {target_date}:"]
     found = False
+
     for order in orders:
-        order_date = datetime.fromisoformat(order['due_date']).date()
-        if order_date == target_date:
-            found = True
-            msg += f"• {order['customer']}: {order['recipe']} – {order['quantity']} шт, статус: {order['status']}\n"
+        # Определяем дату заказа
+        order_date = None
+        if 'due_date' in order:
+            try:
+                order_date = datetime.fromisoformat(order['due_date']).date()
+            except (ValueError, TypeError):
+                continue
+        elif 'date' in order:
+            try:
+                # Предполагаем, что 'date' может быть в формате YYYY-MM-DD или полный ISO
+                date_str = order['date']
+                if 'T' in date_str:
+                    date_str = date_str.split('T')[0]
+                order_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except (ValueError, TypeError, KeyError):
+                continue
+        else:
+            continue  # нет даты – пропускаем
+
+        if order_date != target_date:
+            continue
+
+        found = True
+
+        # Извлекаем общие поля
+        recipe = order.get('recipe', 'Неизвестный рецепт')
+        quantity = order.get('quantity', 0)
+
+        # Определяем тип заказа и формируем строку
+        if 'customer' in order:
+            # Это предзаказ
+            customer = order.get('customer', 'Неизвестный клиент')
+            status = order.get('status', 'неизвестен')
+            line = f"• {customer}: {recipe} – {quantity} шт, статус: {status}"
+        else:
+            # Обычный заказ (без клиента)
+            # Можно показать стоимость или прибыль, если есть
+            cost = order.get('cost', 0)
+            revenue = order.get('revenue', order.get('price', 0))
+            profit = order.get('profit', 0)
+            line = f"• {recipe} – {quantity} шт"
+            if revenue:
+                line += f", выручка: {revenue:.0f} ₽"
+            if profit:
+                line += f", прибыль: {profit:.0f} ₽"
+
+        msg_lines.append(line)
+
     if not found:
-        msg = f"Нет заказов на {target_date}."
+        msg_lines.append("Нет заказов на эту дату.")
+
+    msg = "\n".join(msg_lines)
     await update.message.reply_text(msg)
 async def add_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавить клиента: /add_customer имя телефон [адрес]"""
@@ -949,17 +1299,13 @@ async def remind_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             found = True
     if not found:
         msg = "Нет заказов на сегодня и завтра."
-    await update.message.reply_text(msg, parse_mode='Markdown')
-    scheduled_remind
+    await update.message.reply_text(msg)
 async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Установить текущий чат как административный для напоминаний"""
     chat_id = update.effective_chat.id
     settings['admin_chat_id'] = chat_id
     save_settings()
     await update.message.reply_text(f"✅ Административный чат установлен (ID: {chat_id})")
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_main_menu(update, context, first_time=True)
-
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update, context, first_time=False)
 async def set_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1006,7 +1352,7 @@ async def add_ingredient(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty_pack = float(qty_str.replace(',', '.'))
             unit = unit.lower()
 
-            allowed_units = ['кг', 'г', 'л', 'мл', 'шт']
+            allowed_units = ['кг','г','л','мл','шт','kg','g','l','ml','pcs']
             if unit not in allowed_units:
                 await update.message.reply_text(f"Единица должна быть одной из: {', '.join(allowed_units)}")
                 return
@@ -1545,7 +1891,6 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Помощь ----------
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает главное меню помощи с кнопками разделов"""
     keyboard = [
         [InlineKeyboardButton("📋 Основные команды", callback_data="help_main")],
         [InlineKeyboardButton("📦 Ингредиенты и закупки", callback_data="help_ingredients")],
@@ -1553,13 +1898,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💰 Продажи и аналитика", callback_data="help_sales")],
         [InlineKeyboardButton("🔄 Возвраты и списания", callback_data="help_writeoffs")],
         [InlineKeyboardButton("📅 Клиенты и заказы", callback_data="help_customers")],
-        [InlineKeyboardButton("📊 Категории и планирование", callback_data="help_plans")],
+        [InlineKeyboardButton("📊 Планирование и категории", callback_data="help_plans")],
         [InlineKeyboardButton("📁 Импорт/экспорт", callback_data="help_import_export")],
-        [InlineKeyboardButton("⚙️ Дополнительные настройки", callback_data="help_advanced")]
+        [InlineKeyboardButton("⚙️ Дополнительные настройки", callback_data="help_advanced")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
-        # если вызвано из меню, редактируем сообщение
         await update.callback_query.edit_message_text(
             "📖 Разделы помощи. Выберите интересующий раздел:",
             reply_markup=reply_markup
@@ -1571,11 +1915,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 async def set_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if len(context.args) < 3:
+        if len(context.args) < 2:
             await update.message.reply_text(
-              "Формат: /plan рецепт количество дата\n"
-              "Пример: /plan меренговый_рулет_белый 5 2025-03-15"
-            )
+                "Формат: /set_description рецепт описание\n"
+                "Пример: /set_description меренговый_рулет_белый Взбить белки с сахаром..."
+                )
             return
         recipe_name = context.args[0].lower()
         if recipe_name not in recipes:
@@ -1854,9 +2198,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_recipe_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Основная логика парсинга"""
     # Заменяем запятые на переносы строк и разбиваем
-    text = text.replace(',', '\n')
-    lines = text.split('\n')
-    found = []
+    print(f"process_recipe_text called with text: {text}")
+    lines = text.strip().split('\n')
+    print(f"lines: {lines}")
     units_map = {'г': 'кг', 'мл': 'л', 'кг': 'кг', 'л': 'л', 'шт': 'шт'}
     conversion = {'г': 0.001, 'мл': 0.001, 'кг': 1, 'л': 1, 'шт': 1}
 
@@ -1972,44 +2316,43 @@ async def plan_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plans.append(plan)
     save_plans()
     await update.message.reply_text(f"✅ Запланировано {qty} шт '{name}' на {date_str}")
-async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сформировать список закупок на дату (или все планы)"""
-    target_date = None
-    if context.args:
-        try:
-            target_date = datetime.strptime(context.args[0], "%Y-%m-%d").date()
-        except:
-            await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
-            return
+# ========== Команда /shopping (список покупок) ==========
+async def shopping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список покупок на основе заказов (без Markdown)"""
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
 
-    # Собираем все потребности из планов
-    needs = {}
-    for plan in plans:
-        plan_date = datetime.fromisoformat(plan['date']).date()
-        if target_date and plan_date != target_date:
+    # Собираем заказы на сегодня и завтра
+    upcoming_orders = []
+    for order in orders:
+        if 'date' in order:
+            order_date = datetime.strptime(order['date'], "%Y-%m-%d").date()
+        elif 'due_date' in order:
+            order_date = datetime.strptime(order['due_date'], "%Y-%m-%d").date()
+        else:
             continue
-        recipe_name = plan['recipe']
-        qty = plan['quantity']
+        if order_date == today or order_date == tomorrow:
+            upcoming_orders.append(order)
+
+    if not upcoming_orders:
+        await update.message.reply_text("✅ Нет заказов на сегодня и завтра.")
+        return
+
+    needs = {}
+    for order in upcoming_orders:
+        recipe_name = order['recipe']
+        qty = order.get('quantity', 1)
         if recipe_name not in recipes:
-            continue  # пропускаем, если рецепт вдруг удалён
+            continue
         data = recipes[recipe_name]
         if isinstance(data, dict) and "ingredients" in data:
             ing_dict = data["ingredients"]
         else:
             ing_dict = data
-        # Масштабируем на нужное количество
-        # Для штучных рецептов: ингредиенты даны на 1 шт, умножаем на qty
-        # Для весовых: ингредиенты даны на 1 кг, умножаем на qty
-        scale = qty
         for ing_name, ing_qty in ing_dict.items():
-            need = ing_qty * scale
+            need = ing_qty * qty
             needs[ing_name] = needs.get(ing_name, 0.0) + need
 
-    if not needs:
-        await update.message.reply_text("Нет планов на указанную дату." if target_date else "Нет планов.")
-        return
-
-    # Вычитаем остатки
     to_buy = {}
     for ing_name, need in needs.items():
         stock = ingredients.get(ing_name, {}).get('stock', 0.0)
@@ -2018,13 +2361,13 @@ async def shopping_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             to_buy[ing_name] = deficit
 
     if not to_buy:
-        await update.message.reply_text("✅ Все необходимые ингредиенты уже есть на складе.")
+        await update.message.reply_text("✅ У вас достаточно ингредиентов для выполнения заказов.")
         return
 
-    msg = "🛒 *Список закупок:*\n"
-    for ing_name, deficit in to_buy.items():
+    msg = "🛒 Список покупок\n\n"
+    for ing_name, need in sorted(to_buy.items()):
         unit = ingredients.get(ing_name, {}).get('unit', '')
-        msg += f"• {ing_name}: {deficit:.2f} {unit}\n"
+        msg += f"• {ing_name}: {need:.2f} {unit}\n"
     await update.message.reply_text(msg)
 async def process_recipe_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Основная логика парсинга"""
@@ -2329,26 +2672,6 @@ async def price_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f": себест. {total_cost:.2f} руб (наценка не задана)"
         msg += "\n"
     await update.message.reply_text(msg)
-
-# ---------- Эхо ----------
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    buttons = [   # <-- эта строка должна иметь отступ (4 пробела)
-        "➕ Добавить ингредиент",
-        "📋 Список ингредиентов",
-        "🍰 Добавить рецепт",
-        "💰 Рассчитать себестоимость",
-        "📖 Мои рецепты",
-        "⚖️ Пересчитать рецепт",
-        "📦 Остатки",
-        "🛒 Список покупок",
-        "📊 Аналитика",
-        "📅 Заказы",
-        "❓ Помощь"
-    ]
-    if text in buttons:
-        return
-    await update.message.reply_text(f"Ты написал: {text}")
 # ---------- Обработчик кнопок ----------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2724,7 +3047,7 @@ async def purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Создаём новую партию
     batch = {
-        "id": f"batch_{datetime.now().timestamp()}",
+        "id": f"batch_{uuid.uuid4().hex[:8]}",
         "ingredient": name,
         "initial_quantity": qty,
         "current_quantity": qty,
@@ -3073,10 +3396,11 @@ async def open_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch['expiry_after_open'] = expiry_after_open.isoformat()
     save_batches()
 
+    batch_id = batch.get('id', 'неизвестно')
     await update.message.reply_text(
-        f"✅ Партия '{batch['id']}' от {batch['purchase_date']} отмечена как открытая.\n"
+        f"✅ Партия '{batch_id}' от {batch['purchase_date']} отмечена как открытая.\n"
         f"Новый срок годности: {expiry_after_open} (через {after_open_days} дн. после вскрытия)."
-    )
+        )
 # ========== Команда /price (умная цена) ==========
 # ========== Команда /price (умная цена) ==========
 # ========== Команда /price (умная цена) ==========
@@ -3252,31 +3576,465 @@ async def price_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             price = price_data['price_market']
             level = "Средняя по рынку"
 
-        await query.edit_message_text(
-            f"✅ Выбрана цена {level}: {int(price)} руб за {int(qty) if qty.is_integer() else qty} {unit} '{name}'.\n"
-            f"Чтобы зафиксировать продажу, отправьте:\n"
-            f"/use {name} {qty} {int(price)}"
-        )
+        # Выполняем продажу
+        result_msg = await execute_sale(update, context, name, qty, price)
+
+        # Отправляем результат, заменяя сообщение с кнопками
+        await query.edit_message_text(result_msg)
     else:
         await query.edit_message_text("❓ Неизвестная команда.")
+async def shopping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список закупок на основе заказов и низких остатков. Использование: /shopping [ГГГГ-ММ-ДД]"""
+    target_date = None
+    days_ahead = 3
+
+    # Пороги низкого остатка для разных единиц
+    low_stock_thresholds = {
+        'шт': 3,      # для штучных – меньше 3
+        'кг': 0.5,    # для кг – меньше 0.5
+        'г': 500,     # для граммов – меньше 500 г (0.5 кг)
+        'л': 0.5,     # для литров – меньше 0.5 л
+        'мл': 500     # для миллилитров – меньше 500 мл (0.5 л)
+    }
+
+    if context.args:
+        try:
+            target_date = datetime.strptime(context.args[0], "%Y-%m-%d").date()
+        except ValueError:
+            await update.message.reply_text("Неверный формат даты. Используйте ГГГГ-ММ-ДД")
+            return
+    else:
+        target_date = datetime.now().date() + timedelta(days=days_ahead)
+
+    today = datetime.now().date()
+    relevant_orders = []
+    for order in orders:
+        order_date = datetime.fromisoformat(order['due_date']).date()
+        if today <= order_date <= target_date:
+            relevant_orders.append(order)
+
+    needs = {}
+    if relevant_orders:
+        for order in relevant_orders:
+            recipe_name = order['recipe']
+            qty = order['quantity']
+            if recipe_name not in recipes:
+                continue
+            data = recipes[recipe_name]
+            if isinstance(data, dict) and "ingredients" in data:
+                ing_dict = data["ingredients"]
+            else:
+                ing_dict = data
+            for ing_name, ing_qty in ing_dict.items():
+                need = ing_qty * qty
+                needs[ing_name] = needs.get(ing_name, 0.0) + need
+
+        deficit = {}
+        for ing_name, need in needs.items():
+            stock = ingredients.get(ing_name, {}).get('stock', 0.0)
+            need_deficit = need - stock
+            if need_deficit > 0:
+                deficit[ing_name] = need_deficit
+    else:
+        deficit = {}
+
+    # Определяем ингредиенты с низким остатком с учётом единиц
+    low_stock = {}
+    for ing_name, data in ingredients.items():
+        stock = data.get('stock', 0.0)
+        unit = data.get('unit', 'кг')
+        threshold = low_stock_thresholds.get(unit, 0.5)  # по умолчанию 0.5
+
+        if stock < threshold:
+            low_stock[ing_name] = (stock, unit, threshold)
+
+    # Убираем из low_stock те, что уже есть в deficit
+    for ing_name in deficit.keys():
+        low_stock.pop(ing_name, None)
+
+    if not deficit and not low_stock:
+        await update.message.reply_text("✅ У вас достаточно ингредиентов для заказов, и все остатки в норме.")
+        return
+
+    msg = "🛒 Список покупок\n\n"
+
+    if deficit:
+        msg += "Для заказов до {}:\n".format(target_date)
+        for ing_name, need in sorted(deficit.items()):
+            unit = ingredients.get(ing_name, {}).get('unit', '')
+            msg += f"• {ing_name}: {need:.2f} {unit}\n"
+        msg += "\n"
+
+    if low_stock:
+        msg += f"⚠️ Низкий остаток:\n"
+        for ing_name, (stock, unit, threshold) in sorted(low_stock.items()):
+            msg += f"• {ing_name}: {stock:.2f} {unit} (менее {threshold} {unit})\n"
+
+    await update.message.reply_text(msg)
+async def help_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Словарь соответствия callback_data и текстов разделов
+    help_sections = {
+        "help_main": HELP_MAIN,
+        "help_ingredients": HELP_INGREDIENTS,
+        "help_recipes": HELP_RECIPES,
+        "help_sales": HELP_SALES,
+        "help_writeoffs": HELP_WRITEOFFS,
+        "help_customers": HELP_CUSTOMERS,
+        "help_plans": HELP_PLANS,
+        "help_import_export": HELP_IMPORT_EXPORT,
+        "help_advanced": HELP_ADVANCED,
+    }
+
+    if data in help_sections:
+        # Отправляем текст раздела и кнопку «Назад»
+        keyboard = [[InlineKeyboardButton("« Назад к разделам", callback_data="help_back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(help_sections[data], reply_markup=reply_markup)
+    elif data == "help_back":
+        # Возвращаем главное меню помощи
+        await help_command(update, context)
+    else:
+        # Неизвестный callback – игнорируем или логируем
+        print(f"Неизвестный help callback: {data}")
+def get_main_keyboard():
+    """Главное меню с разделами"""
+    keyboard = [
+        [KeyboardButton("📦 Ингредиенты")],
+        [KeyboardButton("🍰 Рецепты")],
+        [KeyboardButton("💰 Продажи")],
+        [KeyboardButton("📊 Аналитика")],
+        [KeyboardButton("🛒 Закупки")],
+        [KeyboardButton("👥 Клиенты")],
+        [KeyboardButton("❓ Помощь")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def get_ingredients_submenu():
+    """Подменю раздела Ингредиенты"""
+    keyboard = [
+        [KeyboardButton("➕ Добавить ингредиент")],
+        [KeyboardButton("📋 Список ингредиентов")],
+        [KeyboardButton("🔄 Обновить цену")],
+        [KeyboardButton("📦 Закупка (партия)")],
+        [KeyboardButton("⏰ Сроки годности")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_recipes_submenu():
+    """Подменю раздела Рецепты"""
+    keyboard = [
+        [KeyboardButton("➕ Новый рецепт")],
+        [KeyboardButton("📋 Мои рецепты")],
+        [KeyboardButton("🔍 Показать рецепт")],
+        [KeyboardButton("⚖️ Пересчитать")],
+        [KeyboardButton("💰 Себестоимость")],
+        [KeyboardButton("📈 Прайс-лист")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_sales_submenu():
+    keyboard = [
+        [KeyboardButton("📦 Новый заказ")],          # вместо "💰 Продать"
+        [KeyboardButton("💵 Рекомендованная цена")],
+        [KeyboardButton("📊 Прибыль")],              # вместо "📊 Статистика"
+        [KeyboardButton("🏆 Популярные")],
+        [KeyboardButton("🔄 Возврат")],
+        [KeyboardButton("❌ Списание")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def get_analytics_submenu():
+    """Подменю раздела Аналитика"""
+    keyboard = [
+        [KeyboardButton("📈 Прибыль за месяц")],
+        [KeyboardButton("📉 Самые прибыльные")],
+        [KeyboardButton("📊 Отчёт Excel")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_purchases_submenu():
+    """Подменю раздела Закупки"""
+    keyboard = [
+        [KeyboardButton("🛒 Список покупок")],
+        [KeyboardButton("📦 Запланировать")],
+        [KeyboardButton("⏳ Истекающие сроки")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_customers_submenu():
+    """Подменю раздела Клиенты"""
+    keyboard = [
+        [KeyboardButton("➕ Новый клиент")],
+        [KeyboardButton("📅 Создать заказ")],
+        [KeyboardButton("📋 Заказы на дату")],
+        [KeyboardButton("🔔 Напоминания")],
+        [KeyboardButton("« Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+# ========== Онбординг (обучение нового пользователя) ==========
+# ========== Онбординг (обучение нового пользователя) ==========
+async def onboarding_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает онбординг"""
+    if context.user_data.get('onboarding_complete'):
+        await show_main_menu(update, context, first_time=False)
+        return ConversationHandler.END
+
+    context.user_data["onboarding"] = True
+
+    await update.message.reply_text(
+        "👋 Привет! Я помогу тебе вести учёт твоего кондитерского производства.\n\n"
+        "Давай быстро настроим систему. Это займёт пару минут.\n"
+        "Любой шаг можно пропустить."
+    )
+
+    return await onboarding_step1(update, context)
+
+
+async def onboarding_step1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [KeyboardButton("➕ Добавить ингредиент")],
+        [KeyboardButton("⏩ Пропустить")]
+    ]
+
+    await update.message.reply_text(
+        "📦 **Шаг 1 из 4**\n\n"
+        "Добавим ингредиенты.\n\n"
+        "Пример:\n"
+        "`мука 50 кг`\n"
+        "`масло 209.99 180 г`",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+    return ONBOARDING_INGREDIENT
+
+
+async def onboarding_ingredient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "⏩ Пропустить":
+        return await onboarding_step2(update, context)
+
+    if text == "➕ Добавить ингредиент" or text == "➕ Добавить ещё":
+        await update.message.reply_text(
+            "Отправь ингредиент:\n\n"
+            "`мука 50 кг`\n"
+            "`масло 209.99 180 г`",
+            parse_mode="Markdown"
+        )
+        return ONBOARDING_INGREDIENT
+
+    if text == "⏩ Дальше":
+        return await onboarding_step2(update, context)
+
+    args = text.split()
+
+    if len(args) >= 3:
+        context.args = args
+        await add_ingredient(update, context)
+
+        keyboard = [
+            [KeyboardButton("➕ Добавить ещё"), KeyboardButton("⏩ Дальше")]
+        ]
+
+        await update.message.reply_text(
+            "✅ Ингредиент добавлен!",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+
+        return ONBOARDING_INGREDIENT
+
+    await update.message.reply_text(
+        "❗ Неверный формат.\n\n"
+        "Пример:\n"
+        "`мука 50 кг`\n"
+        "`масло 209.99 180 г`",
+        parse_mode="Markdown"
+    )
+
+    return ONBOARDING_INGREDIENT
+
+
+async def onboarding_step2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [KeyboardButton("🍰 Создать рецепт")],
+        [KeyboardButton("⏩ Пропустить")]
+    ]
+
+    await update.message.reply_text(
+        "🍰 **Шаг 2 из 4**\n\n"
+        "Создадим рецепт.\n\n"
+        "Пример:\n"
+        "`/add_recipe2 омлет штук 1: яйца 2, молоко 0.1`",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+    return ONBOARDING_RECIPE
+
+
+async def onboarding_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "⏩ Пропустить":
+        return await onboarding_step3(update, context)
+
+    if text == "⏩ Дальше":
+        return await onboarding_step3(update, context)
+
+    if text.startswith('/add_recipe2'):
+        context.args = text.split()[1:]
+        await add_recipe_scaled(update, context)
+
+        keyboard = [
+            [KeyboardButton("⏩ Дальше")]
+        ]
+
+        await update.message.reply_text(
+            "✅ Рецепт создан!",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+
+        return ONBOARDING_RECIPE
+
+    await update.message.reply_text(
+        "Отправь команду:\n"
+        "`/add_recipe2 название тип количество: ингредиенты`",
+        parse_mode="Markdown"
+    )
+
+    return ONBOARDING_RECIPE
+
+
+async def onboarding_step3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [KeyboardButton("💰 Рассчитать цену")],
+        [KeyboardButton("⏩ Пропустить")]
+    ]
+
+    await update.message.reply_text(
+        "💰 **Шаг 3 из 4**\n\n"
+        "Попробуем рассчитать цену.\n\n"
+        "Пример:\n"
+        "`/price омлет 2`",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+    return ONBOARDING_PRICE
+
+
+async def onboarding_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "⏩ Пропустить":
+        return await onboarding_step4(update, context)
+
+    if text == "⏩ Дальше":
+        return await onboarding_step4(update, context)
+
+    if text.startswith('/price'):
+        context.args = text.split()[1:]
+        await price_command(update, context)
+
+        keyboard = [
+            [KeyboardButton("⏩ Дальше")]
+        ]
+
+        await update.message.reply_text(
+            "✅ Видишь — бот посчитал себестоимость и цену!",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+
+        return ONBOARDING_PRICE
+
+    await update.message.reply_text(
+        "Отправь команду:\n"
+        "`/price название 2`",
+        parse_mode="Markdown"
+    )
+
+    return ONBOARDING_PRICE
+
+
+async def onboarding_step4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onboarding"] = False
+    context.user_data["onboarding_complete"] = True
+
+    await update.message.reply_text(
+        "🎉 **Готово!**\n\n"
+        "Теперь ты можешь использовать бота.\n\n"
+        "Главные команды:\n"
+        "/ingredients\n"
+        "/recipes\n"
+        "/price\n"
+        "/profit",
+        parse_mode='Markdown',
+        reply_markup=get_main_keyboard()
+    )
+
+    return ConversationHandler.END
+
+
+async def onboarding_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onboarding"] = False
+
+    await update.message.reply_text(
+        "❌ Обучение отменено.\n"
+        "Запустить снова можно командой /onboarding",
+        reply_markup=get_main_keyboard()
+    )
+
+    return ConversationHandler.END
+    await update.message.reply_text("Я не понял команду. Попробуйте /help")
 def main():
+    import os
+    from datetime import time
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        ConversationHandler,
+        filters,
+    )
+    from telegram.request import HTTPXRequest
+
+    print("🔥 Запуск main()")
+
     TOKEN = os.environ.get("BOT_TOKEN")
+    if not TOKEN:
+        print("❌ BOT_TOKEN не найден")
+        return
+
+    print("✅ Токен загружен")
 
     request = HTTPXRequest(
         connection_pool_size=20,
         connect_timeout=60,
         read_timeout=60,
         write_timeout=60,
-        pool_timeout=60
+        pool_timeout=60,
     )
+
     application = Application.builder().token(TOKEN).request(request).build()
 
-    # Загружаем данные
+    # --- Загрузка данных ---
     global ingredients, recipes, settings
+
     ingredients.clear()
     ingredients.update(load_data(INGREDIENTS_FILE))
+
     recipes.clear()
     recipes.update(load_data(RECIPES_FILE))
+
     load_settings()
     load_sales()
     load_plans()
@@ -3286,89 +4044,169 @@ def main():
     load_price_history()
     load_batches()
 
+    print("✅ Данные загружены")
+
+    # -------------------------------------------------
     # Диалог импорта рецепта
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('import_recipe', import_recipe_start)],
+    # -------------------------------------------------
+
+    import_conv = ConversationHandler(
+        entry_points=[CommandHandler("import_recipe", import_recipe_start)],
         states={
-            WAITING_RECIPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_text)],
-            WAITING_INGREDIENT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ingredient_price)],
-            WAITING_RECIPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_name)],
-            WAITING_RECIPE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_type)],
+            WAITING_RECIPE_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_text)
+            ],
+            WAITING_INGREDIENT_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ingredient_price)
+            ],
+            WAITING_RECIPE_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_name)
+            ],
+            WAITING_RECIPE_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipe_type)
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-    application.add_handler(conv_handler)
 
-    # Регистрируем команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu", menu))
-    application.add_handler(CommandHandler("add_ingredient", add_ingredient))
-    application.add_handler(CommandHandler("ingredients", show_ingredients))
-    application.add_handler(CommandHandler("add_recipe", add_recipe))
-    application.add_handler(CommandHandler("add_recipe2", add_recipe_scaled))
-    application.add_handler(CommandHandler("recipes", list_recipes))
-    application.add_handler(CommandHandler("calculate", calculate_cost))
-    application.add_handler(CommandHandler("scale", scale_recipe))
-    application.add_handler(CommandHandler("remove_ingredient", remove_ingredient))
-    application.add_handler(CommandHandler("remove_recipe", remove_recipe))
-    application.add_handler(CommandHandler("update_price", update_price))
-    application.add_handler(CommandHandler("export", export_data))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("delete_recipes", delete_all_recipes))
-    application.add_handler(CommandHandler("set_description", set_description))
-    application.add_handler(CommandHandler("show_recipe", show_recipe))
-    application.add_handler(CommandHandler("set_hourly_rate", set_hourly_rate))
-    application.add_handler(CommandHandler("set_packaging", set_packaging))
-    application.add_handler(CommandHandler("set_work_hours", set_work_hours))
-    application.add_handler(CommandHandler("set_markup", set_markup))
-    application.add_handler(CommandHandler("price_list", price_list))
-    application.add_handler(CommandHandler("parse", parse_recipe))
-    application.add_handler(CommandHandler("set_category", set_category))
-    application.add_handler(CommandHandler("categories", list_categories))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("popular", popular))
-    application.add_handler(CommandHandler("add_stock", add_stock))
-    application.add_handler(CommandHandler("stock", show_stock))
-    application.add_handler(CommandHandler("low_stock", low_stock))
-    application.add_handler(CommandHandler("plan", plan_recipe))
-    application.add_handler(CommandHandler("shopping_list", shopping_list))
-    application.add_handler(CommandHandler("export_full", export_full))
-    application.add_handler(CommandHandler("use", use_recipe))
-    application.add_handler(CommandHandler("export_xlsx", export_xlsx))
-    application.add_handler(CommandHandler("report_xlsx", report_xlsx))
-    application.add_handler(CommandHandler("add_customer", add_customer))
-    application.add_handler(CommandHandler("order", create_order))
-    application.add_handler(CommandHandler("orders", list_orders))
-    application.add_handler(CommandHandler("remind", remind_orders))
-    application.add_handler(CommandHandler("set_admin", set_admin))
-    application.add_handler(CommandHandler("write_off", write_off))
-    application.add_handler(CommandHandler("refund", refund))
-    application.add_handler(CommandHandler("price_history", price_history_cmd))
-    application.add_handler(CommandHandler("purchase", purchase))
-    application.add_handler(CommandHandler("expiring", expiring))
-    application.add_handler(CommandHandler("export_full_excel", export_full_excel))
-    application.add_handler(CommandHandler("set_shelf_life", set_shelf_life))
-    application.add_handler(CommandHandler("open_batch", open_batch))
-    application.add_handler(CommandHandler("price", price_command))
-        # Сначала регистрируем специализированные обработчики callback'ов
-    application.add_handler(CallbackQueryHandler(price_button_handler, pattern="^price_"))
-    # ... возможно, другие специализированные обработчики
+    application.add_handler(import_conv)
 
-    # Затем общий обработчик для всех остальных callback'ов (если он есть)
-    application.add_handler(CallbackQueryHandler(button_handler))
+    # -------------------------------------------------
+    # Онбординг
+    # -------------------------------------------------
 
-    # Планировщик для ежедневных напоминаний
+    onboarding_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", onboarding_start),
+            CommandHandler("onboarding", onboarding_start),
+        ],
+        states={
+            ONBOARDING_START: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_step1)
+            ],
+            ONBOARDING_INGREDIENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_ingredient)
+            ],
+            ONBOARDING_RECIPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_recipe)
+            ],
+            ONBOARDING_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_price)
+            ],
+            ONBOARDING_FINISH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_step4)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", onboarding_cancel)],
+    )
+
+    application.add_handler(onboarding_handler)
+
+    # -------------------------------------------------
+    # Команды
+    # -------------------------------------------------
+
+    commands = [
+    ("menu", menu),
+    ("add_ingredient", add_ingredient),
+    ("ingredients", show_ingredients),
+    ("add_recipe", add_recipe),
+    ("add_recipe2", add_recipe_scaled),
+    ("recipes", list_recipes),
+    ("calculate", calculate_cost),
+    ("scale", scale_recipe),
+    ("remove_ingredient", remove_ingredient),
+    ("remove_recipe", remove_recipe),
+    ("update_price", update_price),
+    ("export", export_data),
+    ("help", help_command),
+    ("delete_recipes", delete_all_recipes),
+    ("set_description", set_description),
+    ("show_recipe", show_recipe),
+    ("set_hourly_rate", set_hourly_rate),
+    ("set_packaging", set_packaging),
+    ("set_work_hours", set_work_hours),
+    ("set_markup", set_markup),
+    ("price_list", price_list),
+    ("parse", parse_recipe),
+    ("set_category", set_category),
+    ("categories", list_categories),
+    ("stats", stats),
+    ("popular", popular),
+    ("add_stock", add_stock),
+    ("stock", show_stock),
+    ("low_stock", low_stock),
+    ("plan", plan_recipe),
+    ("export_full", export_full),
+    ("use", use_recipe),
+    ("export_xlsx", export_xlsx),
+    ("report_xlsx", report_xlsx),
+    ("add_customer", add_customer),
+    ("preorder", create_order),          # старая команда предзаказа переименована
+    ("orders", list_orders),
+    ("remind", remind_orders),
+    ("set_admin", set_admin),
+    ("write_off", write_off),
+    ("refund", refund),
+    ("price_history", price_history_cmd),
+    ("purchase", purchase),
+    ("expiring", expiring),
+    ("export_full_excel", export_full_excel),
+    ("set_shelf_life", set_shelf_life),
+    ("open", open_batch),
+    ("price", price_command),
+    ("shopping", shopping),               # команда для списка покупок
+    ("order", order_command),              # новая команда учёта заказов
+    ("profit", profit_command),             # команда прибыли
+]
+    for cmd, func in commands:
+        application.add_handler(CommandHandler(cmd, func))
+    # -------------------------------------------------
+    # Callback кнопки
+    # -------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(price_button_handler, pattern="^price_")
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(help_button_handler, pattern="^help_")
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
+
+    # -------------------------------------------------
+    # Планировщик
+    # -------------------------------------------------
+
     job_queue = application.job_queue
+
     if job_queue:
-        job_queue.run_daily(scheduled_remind, time=time(hour=19, minute=0, second=0))
-        job_queue.run_daily(expiry_check, time=time(hour=8, minute=0, second=0))
+        job_queue.run_daily(
+            scheduled_remind,
+            time=time(hour=19, minute=0),
+        )
 
-    # Обработчики для текстовых сообщений (не команд)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons), group=0)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo), group=1)
+        job_queue.run_daily(
+            expiry_check,
+            time=time(hour=8, minute=0),
+        )
 
-    print("Бот запущен...")
+    # -------------------------------------------------
+    # Текстовые сообщения
+    # -------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons),
+        group=0,
+    )
+
+    print("🚀 Бот запущен")
+
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
